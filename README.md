@@ -59,6 +59,21 @@ claude mcp add --transport http --scope user vault http://localhost:8787/mcp
 
 New sessions get the memory tools; the server must be running.
 
+### Connect from DeepSeek Harness
+
+DSH loads MCP servers as Cordis plugin instances via `@deepseek-ai/dsh-mcp-client`. A ready-to-use patch is in `dsh-cordis.patch.yml`:
+
+```sh
+# Per-session (workspace-local)
+dsh --profile headless --patch ./dsh-cordis.patch.yml "your task"
+
+# Or make it permanent by copying the entry into:
+#   ~/.dsh/profiles/headless/cordis.patch.yml
+#   ~/.dsh/profiles/web/cordis.patch.yml
+```
+
+The patch connects to the local vault at `http://localhost:8787/mcp/memory-vault`; tools appear as `mcp__vault__view`, `mcp__vault__create`, etc. The server must be running.
+
 ### Seed a corpus
 
 Copy markdown files into `memory/<project>/` (or `memory/shared/`) — the store is the folder. Give each `name:` and `description:` frontmatter and an index line in that space's `MEMORY.md` (or let the model tidy that up next session).

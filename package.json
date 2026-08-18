@@ -1,8 +1,28 @@
 {
   "name": "memory-vault",
-  "private": true,
-  "version": "0.1.0",
+  "version": "0.2.2",
+  "mcpName": "io.github.apurv101/memory-vault",
+  "description": "Claude-style memory over a local folder, served via MCP — per-project spaces plus a shared org layer. Harness-neutral, customer-owned.",
   "type": "module",
+  "license": "MIT",
+  "bin": {
+    "memory-vault": "./server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "scripts/scrape.mjs"
+  ],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "memory",
+    "claude",
+    "agent-memory",
+    "model-context-protocol"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.mjs",
     "scrape": "node scripts/scrape.mjs"

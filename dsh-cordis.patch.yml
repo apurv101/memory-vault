@@ -1,0 +1,18 @@
+# DeepSeek Harness Cordis patch to enable the local Memory Vault MCP server.
+# Apply this patch in one of two ways:
+#
+# 1. Per-session (workspace-local, no changes under ~/.dsh):
+#    dsh --profile headless --patch ./dsh-cordis.patch.yml "your task"
+#    dsh --profile web --patch ./dsh-cordis.patch.yml
+#
+# 2. Permanent (copy these entries into your profile patch):
+#    ~/.dsh/profiles/headless/cordis.patch.yml
+#    ~/.dsh/profiles/web/cordis.patch.yml
+#
+# The vault MCP server must be running (npm start in this repo).
+- id: mcp-vault
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: vault
+    transport: streamable-http
+    url: http://localhost:8787/mcp/memory-vault
