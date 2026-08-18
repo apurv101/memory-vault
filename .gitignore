@@ -11,6 +11,12 @@ build/
 .env
 .env.*
 
+# Node
+node_modules/
+
+# Soft-deleted memories
+memory/.trash/
+
 # OS / editors
 .DS_Store
 .idea/

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vault": {
+      "type": "http",
+      "url": "http://localhost:8787/mcp/memory-vault"
+    }
+  }
+}
