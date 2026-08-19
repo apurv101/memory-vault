@@ -1,0 +1,42 @@
+{
+  "conversations": [
+    {
+      "id": "falcon",
+      "sessions": [
+        {
+          "date": "2026-03-02",
+          "transcript": [
+            "USER: Kicking off the internal API rewrite today. We're calling the project Falcon internally — use that codename in docs.",
+            "ASSISTANT: Got it, project Falcon. What's the stack?",
+            "USER: The service runs on Postgres 15, and we deploy on Friday afternoons after the change-review call.",
+            "ASSISTANT: Noted — Postgres 15, Friday afternoon deploys. Who's on the team?",
+            "USER: Marco owns the billing service, I own the gateway. We've got a $40k budget for contractors this half.",
+            "ASSISTANT: Understood: Marco on billing, you on the gateway, $40k contractor budget for the half."
+          ]
+        },
+        {
+          "date": "2026-04-10",
+          "transcript": [
+            "USER: Perf review came back for Falcon. We're committing to a 200ms p95 latency target on the search endpoint.",
+            "ASSISTANT: 200ms p95 on search — is that against staging or prod?",
+            "USER: Staging for now. The staging cluster lives in eu-west-1 by the way.",
+            "ASSISTANT: Noted, staging is in eu-west-1.",
+            "USER: Also heads up — Marco starts parental leave next week. Dana is taking over the billing service while he's out, probably through the end of the year.",
+            "ASSISTANT: Congrats to Marco! I'll treat Dana as the billing owner going forward."
+          ]
+        },
+        {
+          "date": "2026-05-21",
+          "transcript": [
+            "USER: Two updates on Falcon. First: the database migration is done — we're fully off Postgres 15 now, everything runs on Postgres 16.",
+            "ASSISTANT: Migration complete, Postgres 16 across the board. What's the second update?",
+            "USER: We killed Friday deploys. Too many weekend incidents. Deploys now happen Wednesday mornings.",
+            "ASSISTANT: Wednesday morning deploys it is. Anything else?",
+            "USER: Nothing major. Lunch order got messed up again, but that's not your problem.",
+            "ASSISTANT: Ha — noted, and not filed under project facts."
+          ]
+        }
+      ]
+    }
+  ]
+}

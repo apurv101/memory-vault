@@ -25,3 +25,7 @@ memory/.trash/
 # Data
 data/
 *.sqlite3
+
+# Evals: downloaded datasets and resume cache (results/ itself is committed)
+evals/datasets/
+evals/results/.cache/

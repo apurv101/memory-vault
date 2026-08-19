@@ -1,0 +1,42 @@
+{
+  "questions": [
+    {
+      "id": "q1-codename",
+      "conv": "falcon",
+      "category": "single-hop",
+      "question": "What is the internal codename of the API rewrite project?",
+      "gold": "Falcon"
+    },
+    {
+      "id": "q2-billing-owner",
+      "conv": "falcon",
+      "category": "multi-session",
+      "question": "Who currently owns the billing service, and why did ownership change?",
+      "gold": "Dana owns billing — she took over when Marco went on parental leave (April 2026). Correct answers must name Dana as the current owner; naming Marco as current owner is incorrect."
+    },
+    {
+      "id": "q3-postgres",
+      "conv": "falcon",
+      "category": "knowledge-update",
+      "question": "Which Postgres version does the project run on?",
+      "gold": "Postgres 16 (migrated off 15, completed May 2026). Answering Postgres 15 is incorrect.",
+      "staleCheck": { "context": "postgres", "old": "15", "new": "16" }
+    },
+    {
+      "id": "q4-deploy-day",
+      "conv": "falcon",
+      "category": "knowledge-update",
+      "question": "On which day of the week do deploys happen?",
+      "gold": "Wednesday (mornings) — moved from Friday in May 2026. Answering Friday is incorrect.",
+      "staleCheck": { "context": "deploy", "old": "friday", "new": "wednesday" }
+    },
+    {
+      "id": "q5-cloud-spend",
+      "conv": "falcon",
+      "category": "abstention",
+      "question": "What is the project's monthly cloud spend?",
+      "gold": "NOT_IN_MEMORY",
+      "note": "Never stated. The $40k contractor budget is a deliberate near-miss distractor; quoting it as cloud spend is incorrect."
+    }
+  ]
+}
