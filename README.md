@@ -35,15 +35,40 @@ memory/
 
 The scope is carried in the URL: `POST /mcp/<project>` sandboxes a session to `memory/<project>/` plus `shared/`; bare `POST /mcp` is the unscoped whole-vault view — the org "gardener" scope for pruning across projects and promoting facts into `shared/`.
 
-### Run
+### Quickstart
+
+The package is [on npm](https://www.npmjs.com/package/memory-vault) — no clone, no dependencies (Node ≥18):
 
 ```sh
-npm start                   # serves ./memory at http://localhost:8787 (127.0.0.1 only)
+MEMORY_DIR=~/memory-vault npx memory-vault   # serves the folder at http://localhost:8787 (127.0.0.1 only)
 ```
 
-Env knobs: `MEMORY_DIR` (store location), `VAULT_PORT`.
+Set `MEMORY_DIR` to where you want the vault to live — the default is `./memory` relative to wherever you ran the command. `VAULT_PORT` overrides the port. From a clone, `npm start` does the same thing.
 
-### Connect from Claude Code
+### Connect a repo: `npx memory-vault connect`
+
+One command from the repo root wires it up for every harness it finds:
+
+```sh
+npx -y memory-vault connect        # add --dry-run to preview, --project <name> to override the space name
+```
+
+It starts the server if it's down (store: `$MEMORY_DIR`, default `~/.memory-vault`), then writes **both layers each detected harness needs** — the MCP registration in its own config format, and the memory ritual in a rules file it actually loads:
+
+| Harness | MCP registration | Ritual |
+|---|---|---|
+| Claude Code | `.mcp.json` (always written — the repo-level MCP convention) | `CLAUDE.md` (imports `@AGENTS.md`) |
+| Cursor | `.cursor/mcp.json` | `AGENTS.md` |
+| Codex | `.codex/config.toml` (trusted projects) | `AGENTS.md` |
+| DSH | printed pointer to `dsh-cordis.patch.yml` (profile patch stays manual) | — |
+
+Re-running is idempotent — existing entries are left alone, missing ones added. Then restart the session and approve the `vault` MCP server when prompted; the memory tools appear from the next session on. If the repo already has harness memory to import, see the scraper below.
+
+Or don't do it yourself:
+
+> **Ask your agent**: "Set up memory-vault for this repo — run `npx -y memory-vault connect` from the repo root and relay its output."
+
+### Connect from Claude Code (manual)
 
 Per repo (recorded in the repo's `.mcp.json`):
 
@@ -99,4 +124,4 @@ Per-harness adapters, each stamping its own `source` (`scrape:<adapter>`) and or
 Everything lands in `memory/<project>/` (project = repo dir name, override with `--project`) and only that project's `MEMORY.md` is rebuilt. Names are stable, so re-running is an idempotent refresh. `--only <a,b>` runs a subset of adapters (`skills` = `claude-skills`). User-level files (`~/.claude/CLAUDE.md`, `~/.claude/skills/`) are personal, not org memory — opt in with `--include-user` / `--include-user-skills`. `--dry-run` previews without storing; `--claude-home` overrides `~/.claude` (mainly for tests). Adding a harness = adding one adapter block in `scripts/scrape.mjs`.
 ## Status
 
-MVP above is the read/write pipe. Write governance (extraction, dedup, contradiction handling, review) comes next. Strategy notes live outside this repo; see `docs/` for the architecture sketch.
+MVP above is the read/write pipe. Write governance (extraction, dedup, contradiction handling, review) comes next. See `docs/roadmap.md` for the path from local MVP to org deployment, and `docs/architecture.md` for the architecture sketch.

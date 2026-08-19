@@ -3,13 +3,13 @@
   "name": "io.github.apurv101/memory-vault",
   "title": "Memory Vault",
   "description": "Claude-style memory over a local folder via MCP — per-project spaces plus a shared org layer.",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "memory-vault",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "streamable-http",

@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // Memory Vault — Claude-style memory primitives over a local folder, via MCP.
 //
-//   node server.mjs        (or: npm start)
+//   node server.mjs                (or: npm start) — serve the vault
+//   npx memory-vault connect       — wire the current repo to the vault
+//                                    (starts the server if down, writes each
+//                                    detected harness's MCP config + rules file)
 //
 // The store is a plain directory of markdown files (default ./memory), one
 // subdirectory per project plus an org-wide shared/ space, each with its own
@@ -31,13 +34,17 @@ import {
   rm,
   stat,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { openSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const MEMORY_DIR = resolve(process.env.MEMORY_DIR ?? "./memory");
 const PORT = Number(process.env.VAULT_PORT ?? 8787);
 
 const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INFO = { name: "memory-vault", version: "0.2.0" };
+const SERVER_INFO = { name: "memory-vault", version: "0.3.0" };
 
 const instructionsFor = (scope) =>
   scope
@@ -359,8 +366,185 @@ const server = createServer(async (req, res) => {
   }
 });
 
-await mkdir(MEMORY_DIR, { recursive: true });
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`memory-vault serving ${MEMORY_DIR}`);
-  console.log(`MCP endpoints: http://localhost:${PORT}/mcp/<project> (scoped), http://localhost:${PORT}/mcp (whole vault)`);
-});
+// ── connect — wire the current repo to the vault ──────────────────────────────
+//
+// One command replaces the setup recipe: make sure the server is up, then for
+// each harness present write both layers it needs — the MCP registration in
+// its own config format, and the memory ritual in a rules file it loads.
+
+const SELF = fileURLToPath(import.meta.url);
+const exists = (p) => stat(p).then(() => true, () => false);
+
+const MEMORY_SECTION = `## Memory
+
+This repo uses the vault MCP server (\`vault\`) for persistent memory. At session start, view \`MEMORY.md\` with the vault tools and read any entries relevant to the task. Before finishing, save durable facts, corrections, lessons, and decisions to the vault — one markdown file per fact with \`name:\`/\`description:\` frontmatter — and add or update its line in \`MEMORY.md\`. Check whether an existing memory already covers it before creating a new one. Facts that apply beyond this project go in \`shared/\` (update \`shared/MEMORY.md\`). Prefer the vault over any built-in auto-memory.
+`;
+
+async function serverUp() {
+  try {
+    await fetch(`http://127.0.0.1:${PORT}/`, { signal: AbortSignal.timeout(1000) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Merge one entry into a { mcpServers: { ... } } JSON config, preserving the
+// rest of the file. Returns "created" | "updated" | "unchanged".
+async function mergeMcpJson(path, entry, dryRun) {
+  const raw = await readFile(path, "utf8").catch(() => null);
+  let config = {};
+  if (raw !== null) {
+    try {
+      config = JSON.parse(raw);
+    } catch {
+      throw new Error(`${path} is not valid JSON — fix it or add the vault entry by hand`);
+    }
+  }
+  config.mcpServers ??= {};
+  if (JSON.stringify(config.mcpServers.vault) === JSON.stringify(entry)) return "unchanged";
+  const status = raw === null ? "created" : "updated";
+  config.mcpServers.vault = entry;
+  if (!dryRun) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify(config, null, 2) + "\n");
+  }
+  return status;
+}
+
+async function connect(argv) {
+  let project = null;
+  let dryRun = false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--project") project = argv[++i];
+    else if (argv[i] === "--dry-run") dryRun = true;
+    else throw new Error(`unknown flag: ${argv[i]} (usage: memory-vault connect [--project <name>] [--dry-run])`);
+  }
+  const cwd = process.cwd();
+  project = (project ?? basename(cwd))
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, 64);
+  if (!project) throw new Error("could not derive a project name from the directory — pass --project <name>");
+  const url = `http://localhost:${PORT}/mcp/${project}`;
+  const lines = [];
+
+  // 1. The server. If it's already up it keeps its own MEMORY_DIR; only a
+  // fresh start needs a store location.
+  if (await serverUp()) {
+    lines.push(`server   already running on port ${PORT}`);
+  } else if (dryRun) {
+    lines.push(`server   down — would start it (store: ${process.env.MEMORY_DIR ?? join(homedir(), ".memory-vault")})`);
+  } else {
+    const storeDir = resolve(process.env.MEMORY_DIR ?? join(homedir(), ".memory-vault"));
+    const log = openSync(join(tmpdir(), "memory-vault.log"), "a");
+    spawn(process.execPath, [SELF], {
+      detached: true,
+      stdio: ["ignore", log, log],
+      env: { ...process.env, MEMORY_DIR: storeDir },
+    }).unref();
+    for (let i = 0; i < 20 && !(await serverUp()); i++) await new Promise((r) => setTimeout(r, 250));
+    if (!(await serverUp())) throw new Error(`started the server but it did not come up — see ${join(tmpdir(), "memory-vault.log")}`);
+    lines.push(`server   started on port ${PORT} (store: ${storeDir}, log: ${join(tmpdir(), "memory-vault.log")})`);
+  }
+
+  // 2. MCP registration, one config per harness. Claude Code's .mcp.json is
+  // always written — it's the repo-level MCP convention; the others only when
+  // the harness is installed (user-level dotdir) or already used in this repo.
+  const claudeStatus = await mergeMcpJson(join(cwd, ".mcp.json"), { type: "http", url }, dryRun);
+  lines.push(`claude   .mcp.json ${claudeStatus} (vault → ${url})`);
+
+  if ((await exists(join(homedir(), ".cursor"))) || (await exists(join(cwd, ".cursor")))) {
+    const status = await mergeMcpJson(join(cwd, ".cursor", "mcp.json"), { url }, dryRun);
+    lines.push(`cursor   .cursor/mcp.json ${status}`);
+  } else {
+    lines.push("cursor   not detected — skipped");
+  }
+
+  if ((await exists(join(homedir(), ".codex"))) || (await exists(join(cwd, ".codex")))) {
+    // Project-scoped Codex config (trusted projects). TOML is appended, not
+    // parsed — if a vault block already exists we only verify the URL.
+    const tomlPath = join(cwd, ".codex", "config.toml");
+    const toml = await readFile(tomlPath, "utf8").catch(() => null);
+    if (toml === null || !toml.includes("[mcp_servers.vault]")) {
+      if (!dryRun) {
+        await mkdir(dirname(tomlPath), { recursive: true });
+        await writeFile(tomlPath, `${toml?.trimEnd() ? toml.trimEnd() + "\n\n" : ""}[mcp_servers.vault]\nurl = "${url}"\n`);
+      }
+      lines.push(`codex    .codex/config.toml ${toml === null ? "created" : "updated"} (trusted projects only)`);
+    } else {
+      lines.push(
+        toml.includes(`url = "${url}"`)
+          ? "codex    .codex/config.toml unchanged"
+          : `codex    .codex/config.toml already has a vault entry with a different url — update it by hand to ${url}`,
+      );
+    }
+  } else {
+    lines.push("codex    not detected — skipped");
+  }
+
+  if (await exists(join(homedir(), ".dsh"))) {
+    lines.push("dsh      detected — apply dsh-cordis.patch.yml to your profile (see README)");
+  }
+
+  // 3. The ritual. AGENTS.md carries it (Codex, Cursor, and the growing
+  // cross-harness convention); CLAUDE.md imports it via @AGENTS.md so the
+  // text lives in one place.
+  const agentsPath = join(cwd, "AGENTS.md");
+  const agents = await readFile(agentsPath, "utf8").catch(() => null);
+  if (agents === null) {
+    if (!dryRun) await writeFile(agentsPath, `# ${project}\n\n${MEMORY_SECTION}`);
+    lines.push("rules    AGENTS.md created with the memory section");
+  } else if (!/vault/i.test(agents)) {
+    if (!dryRun) await writeFile(agentsPath, `${agents.trimEnd()}\n\n${MEMORY_SECTION}`);
+    lines.push("rules    AGENTS.md memory section appended");
+  } else {
+    lines.push("rules    AGENTS.md unchanged");
+  }
+
+  const claudeMdPath = join(cwd, "CLAUDE.md");
+  const claudeMd = await readFile(claudeMdPath, "utf8").catch(() => null);
+  if (claudeMd === null) {
+    if (!dryRun) await writeFile(claudeMdPath, "@AGENTS.md\n");
+    lines.push("rules    CLAUDE.md created (imports @AGENTS.md)");
+  } else if (!/vault/i.test(claudeMd) && !claudeMd.includes("@AGENTS.md")) {
+    if (!dryRun) await writeFile(claudeMdPath, `${claudeMd.trimEnd()}\n\n@AGENTS.md\n`);
+    lines.push("rules    CLAUDE.md @AGENTS.md import appended");
+  } else {
+    lines.push("rules    CLAUDE.md unchanged");
+  }
+
+  console.log(`memory-vault connect — project "${project}"${dryRun ? " (dry run)" : ""}\n`);
+  for (const l of lines) console.log(`  ${l}`);
+  console.log("\nRestart your session and approve the vault MCP server when prompted.");
+}
+
+// ── CLI dispatch ──────────────────────────────────────────────────────────────
+
+const USAGE = `memory-vault — Claude-style memory over a local folder, via MCP
+
+  memory-vault [serve]     serve the vault (MEMORY_DIR, VAULT_PORT)
+  memory-vault connect     wire the current repo to the vault:
+                           start the server if down, write each detected
+                           harness's MCP config and rules file
+                           [--project <name>] [--dry-run]`;
+
+const cmd = process.argv[2];
+if (cmd === "connect") {
+  try {
+    await connect(process.argv.slice(3));
+  } catch (err) {
+    console.error(`memory-vault connect: ${err.message}`);
+    process.exit(1);
+  }
+} else if (cmd === undefined || cmd === "serve") {
+  await mkdir(MEMORY_DIR, { recursive: true });
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`memory-vault serving ${MEMORY_DIR}`);
+    console.log(`MCP endpoints: http://localhost:${PORT}/mcp/<project> (scoped), http://localhost:${PORT}/mcp (whole vault)`);
+  });
+} else {
+  console.log(USAGE);
+  process.exit(cmd === "help" || cmd === "--help" || cmd === "-h" ? 0 : 1);
+}
