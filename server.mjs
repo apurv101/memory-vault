@@ -485,7 +485,24 @@ async function connect(argv) {
   }
 
   if (await exists(join(homedir(), ".dsh"))) {
-    lines.push("dsh      detected — apply dsh-cordis.patch.yml to your profile (see README)");
+    // Repo-local Cordis patch with the project-scoped URL. dsh has no repo-level
+    // auto-loaded config, so the patch is applied per-session via --patch (or
+    // copied into a profile to make it permanent — the file header says how).
+    const patchPath = join(cwd, "dsh-cordis.patch.yml");
+    const patchEntry = `- id: mcp-vault\n  name: '@deepseek-ai/dsh-mcp-client'\n  config:\n    serverName: vault\n    transport: streamable-http\n    url: ${url}\n`;
+    const patchContent = `# dsh Cordis patch — load the memory-vault MCP server (project "${project}").\n# Per-session:  dsh --patch ./dsh-cordis.patch.yml [--profile <name>] ["your task"]\n# Permanent:    copy the entry below into ~/.dsh/profiles/<name>/cordis.patch.yml\n# The vault server must be running (npx memory-vault connect starts it if down).\n${patchEntry}`;
+    const patch = await readFile(patchPath, "utf8").catch(() => null);
+    if (patch === patchContent || (patch !== null && patch.includes("id: mcp-vault") && patch.includes(`url: ${url}`))) {
+      lines.push("dsh      dsh-cordis.patch.yml unchanged — run: dsh --patch ./dsh-cordis.patch.yml");
+    } else if (patch !== null && patch.includes("id: mcp-vault")) {
+      lines.push(`dsh      dsh-cordis.patch.yml already has a vault entry with a different url — update it by hand to ${url}`);
+    } else if (patch !== null) {
+      if (!dryRun) await writeFile(patchPath, `${patch.trimEnd()}\n\n${patchEntry}`);
+      lines.push("dsh      dsh-cordis.patch.yml updated — run: dsh --patch ./dsh-cordis.patch.yml");
+    } else {
+      if (!dryRun) await writeFile(patchPath, patchContent);
+      lines.push("dsh      dsh-cordis.patch.yml created — run: dsh --patch ./dsh-cordis.patch.yml");
+    }
   }
 
   // 3. The ritual. AGENTS.md carries it (Codex, Cursor, and the growing

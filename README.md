@@ -1,127 +1,130 @@
 # Memory Vault
 
-An organizational memory layer that works with any harness, any model. Customer-owned, permission-first, harness-neutral.
+Local, persistent memory for coding agents, served over MCP.
 
-**Thesis**: the harness is temporary, the model is temporary, the memory is the org. The vault holds the one asset that survives every model swap and every vendor switch.
+Memory Vault stores facts as ordinary Markdown files. Each project gets an isolated memory space, while `shared/` holds facts that apply across projects. The files stay on your machine and remain usable if you change models or agent harnesses.
 
-## What it is
+## How it works
 
-- **Store**: memories as raw content plus metadata (provenance, ACLs, expiry). Embeddings are rebuilt from raw content, so the vault is never locked to an embedding model.
-- **Interface**: MCP server for reads and writes, plus ingestion pipelines for an org's existing corpus (docs, tickets, chat, code).
-- **Write governance**: the actual product. Session-to-memory extraction, dedup, contradiction resolution, decay, review queues, provenance on every entry.
+The MCP server gives an agent six file operations: `view`, `create`, `str_replace`, `insert`, `delete`, and `rename`.
 
-## What it is not
+The agent uses those tools to maintain small memory files and a `MEMORY.md` index. There is no database, vector search, or embedding model. The Markdown files are the source of truth, so you can read, edit, grep, or version them yourself.
 
-- Not a harness. Harnesses are each vendor's crown jewels; the vault sits one layer below, where a standard interface (MCP) already exists.
-- Not hosted memory. The vault lives inside the customer's perimeter.
-- Not a model. Intelligence is rented; memory is owned.
-
-## MVP: a local vault — Claude-style memory over a folder
-
-Local-only, zero dependencies, one file (`server.mjs`). The store is a plain directory (`memory/`) of markdown files with `MEMORY.md` indexes — the same shape Claude Code keeps its own memory in. The server exposes exactly Claude's core memory commands over MCP — `view`, `create`, `str_replace`, `insert`, `delete`, `rename` — sandboxed to the requesting project's slice of that folder. No search engine, no database, no auth: the *model* maintains the index, checks for duplicates, and decides what to keep, guided by the server's instructions. Files are the source of truth — edit them by hand, grep them, sync the folder with git.
-
-### Layout — per-project spaces + a shared org layer
-
-```
+```text
 memory/
-  MEMORY.md               # vault index: one line per space
-  shared/                 # org-wide memory, read-write from every project scope
-    MEMORY.md
-  <project>/              # one space per project, isolated from the others
-    MEMORY.md
+  MEMORY.md          # index of project spaces
+  shared/
+    MEMORY.md        # cross-project facts
     *.md
-    skills/<name>/        # whole skill folders scraped into the vault
+  <project>/
+    MEMORY.md        # project index
+    *.md
 ```
 
-The scope is carried in the URL: `POST /mcp/<project>` sandboxes a session to `memory/<project>/` plus `shared/`; bare `POST /mcp` is the unscoped whole-vault view — the org "gardener" scope for pruning across projects and promoting facts into `shared/`.
+A project connection can access its own directory and `shared/`, but not other projects. An unscoped connection can access the whole vault for cross-project maintenance.
 
-### Quickstart
+## Requirements
 
-The package is [on npm](https://www.npmjs.com/package/memory-vault) — no clone, no dependencies (Node ≥18):
+- Node.js 18 or newer
+- An MCP client that supports Streamable HTTP
+
+Memory Vault has no runtime dependencies.
+
+## Connect a repository
+
+Run this from the repository you want to connect:
 
 ```sh
-MEMORY_DIR=~/memory-vault npx memory-vault   # serves the folder at http://localhost:8787 (127.0.0.1 only)
+npx -y memory-vault connect
 ```
 
-Set `MEMORY_DIR` to where you want the vault to live — the default is `./memory` relative to wherever you ran the command. `VAULT_PORT` overrides the port. From a clone, `npm start` does the same thing.
+This command:
 
-### Connect a repo: `npx memory-vault connect`
+1. Starts the local server if it is not already running.
+2. Creates a project-scoped MCP connection.
+3. Adds the memory instructions the detected agent harness needs.
 
-One command from the repo root wires it up for every harness it finds:
+By default, `connect` stores memory in `~/.memory-vault` and derives the project name from the current directory.
 
 ```sh
-npx -y memory-vault connect        # add --dry-run to preview, --project <name> to override the space name
+npx -y memory-vault connect --dry-run          # preview changes
+npx -y memory-vault connect --project my-app  # choose the project name
 ```
 
-It starts the server if it's down (store: `$MEMORY_DIR`, default `~/.memory-vault`), then writes **both layers each detected harness needs** — the MCP registration in its own config format, and the memory ritual in a rules file it actually loads:
+Restart your agent session after connecting and approve the `vault` MCP server if prompted.
 
-| Harness | MCP registration | Ritual |
-|---|---|---|
-| Claude Code | `.mcp.json` (always written — the repo-level MCP convention) | `CLAUDE.md` (imports `@AGENTS.md`) |
-| Cursor | `.cursor/mcp.json` | `AGENTS.md` |
-| Codex | `.codex/config.toml` (trusted projects) | `AGENTS.md` |
-| DSH | printed pointer to `dsh-cordis.patch.yml` (profile patch stays manual) | — |
+### Supported harnesses
 
-Re-running is idempotent — existing entries are left alone, missing ones added. Then restart the session and approve the `vault` MCP server when prompted; the memory tools appear from the next session on. If the repo already has harness memory to import, see the scraper below.
-
-Or don't do it yourself:
-
-> **Ask your agent**: "Set up memory-vault for this repo — run `npx -y memory-vault connect` from the repo root and relay its output."
-
-### Connect from Claude Code (manual)
-
-Per repo (recorded in the repo's `.mcp.json`):
-
-```sh
-claude mcp add --transport http --scope project vault http://localhost:8787/mcp/<project>
-```
-
-Optionally also at user scope for the whole-vault gardener view — the project-scope entry of the same name wins inside a repo:
-
-```sh
-claude mcp add --transport http --scope user vault http://localhost:8787/mcp
-```
-
-New sessions get the memory tools; the server must be running.
-
-### Connect from DeepSeek Harness
-
-DSH loads MCP servers as Cordis plugin instances via `@deepseek-ai/dsh-mcp-client`. A ready-to-use patch is in `dsh-cordis.patch.yml`:
-
-```sh
-# Per-session (workspace-local)
-dsh --profile headless --patch ./dsh-cordis.patch.yml "your task"
-
-# Or make it permanent by copying the entry into:
-#   ~/.dsh/profiles/headless/cordis.patch.yml
-#   ~/.dsh/profiles/web/cordis.patch.yml
-```
-
-The patch connects to the local vault at `http://localhost:8787/mcp/memory-vault`; tools appear as `mcp__vault__view`, `mcp__vault__create`, etc. The server must be running.
-
-### Seed a corpus
-
-Copy markdown files into `memory/<project>/` (or `memory/shared/`) — the store is the folder. Give each `name:` and `description:` frontmatter and an index line in that space's `MEMORY.md` (or let the model tidy that up next session).
-
-### Cold-start an existing repo (memory scraper)
-
-First time connecting the vault on a repo that already has harness memory? Scrape it in:
-
-```sh
-node scripts/scrape.mjs <repo-path> [--dry-run]     # writes into memory/<project>/
-```
-
-Per-harness adapters, each stamping its own `source` (`scrape:<adapter>`) and origin path:
-
-| Adapter | Scrapes |
+| Harness | Files configured |
 |---|---|
-| `claude-memory` | `~/.claude/projects/<repo-slug>/memory/*.md` (Claude Code auto-memory) |
-| `claude-instructions` | `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md` |
-| `claude-skills` | `.claude/skills/*` (whole folders, into `skills/<name>/`; add `--include-user-skills` for `~/.claude/skills/*`), `.claude/commands/*.md`, `.claude/agents/*.md` |
-| `codex` | `AGENTS.md` |
-| `cursor` | `.cursorrules`, `.cursor/rules/*` |
+| Claude Code | `.mcp.json`, `CLAUDE.md` |
+| Cursor | `.cursor/mcp.json`, `AGENTS.md` |
+| Codex | `.codex/config.toml`, `AGENTS.md` |
+| DeepSeek Harness | `dsh-cordis.patch.yml` |
 
-Everything lands in `memory/<project>/` (project = repo dir name, override with `--project`) and only that project's `MEMORY.md` is rebuilt. Names are stable, so re-running is an idempotent refresh. `--only <a,b>` runs a subset of adapters (`skills` = `claude-skills`). User-level files (`~/.claude/CLAUDE.md`, `~/.claude/skills/`) are personal, not org memory — opt in with `--include-user` / `--include-user-skills`. `--dry-run` previews without storing; `--claude-home` overrides `~/.claude` (mainly for tests). Adding a harness = adding one adapter block in `scripts/scrape.mjs`.
-## Status
+For DSH, start a session with the generated patch:
 
-MVP above is the read/write pipe. Write governance (extraction, dedup, contradiction handling, review) comes next. See `docs/roadmap.md` for the path from local MVP to org deployment, and `docs/architecture.md` for the architecture sketch.
+```sh
+dsh --patch ./dsh-cordis.patch.yml --profile headless "your task"
+```
+
+## Run the server directly
+
+```sh
+MEMORY_DIR=~/.memory-vault npx memory-vault
+```
+
+The server listens on `127.0.0.1:8787` by default.
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `MEMORY_DIR` | `./memory` | Directory containing the vault |
+| `VAULT_PORT` | `8787` | Local HTTP port |
+
+From a cloned repository, `npm start` runs the same server.
+
+### MCP endpoints
+
+```text
+POST /mcp/<project>  project memory plus shared memory
+POST /mcp            whole-vault access
+```
+
+For example, a manual Claude Code connection is:
+
+```sh
+claude mcp add --transport http --scope project vault http://localhost:8787/mcp/my-project
+```
+
+## Memory format
+
+Store one durable fact per Markdown file:
+
+```md
+---
+name: preferred-language
+description: The project's preferred implementation language
+---
+
+Use TypeScript for new application code.
+```
+
+Add a pointer to the space's `MEMORY.md`:
+
+```md
+- [preferred-language](preferred-language.md) — use TypeScript for new application code
+```
+
+The server instructs agents to check for an existing memory before creating one, update facts instead of duplicating them, and remove memories that become incorrect.
+
+## Current scope
+
+The current release is a local Markdown store, an MCP interface, and a cross-harness setup command.
+
+Automatic extraction, semantic search, programmatic deduplication, contradiction resolution, provenance, review queues, authentication, and remote deployment are not implemented. They are possible future directions, described in [the roadmap](docs/roadmap.md) and [architecture sketch](docs/architecture.md).
+
+## Package
+
+- npm: [`memory-vault`](https://www.npmjs.com/package/memory-vault)
+- MCP registry: `io.github.apurv101/memory-vault`
+- License: MIT

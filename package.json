@@ -6,11 +6,10 @@
   "type": "module",
   "license": "MIT",
   "bin": {
-    "memory-vault": "./server.mjs"
+    "memory-vault": "server.mjs"
   },
   "files": [
-    "server.mjs",
-    "scripts/scrape.mjs"
+    "server.mjs"
   ],
   "keywords": [
     "mcp",
@@ -24,7 +23,6 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node server.mjs",
-    "scrape": "node scripts/scrape.mjs"
+    "start": "node server.mjs"
   }
 }
