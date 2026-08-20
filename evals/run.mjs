@@ -38,7 +38,7 @@ const EVALS_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(EVALS_DIR, "..");
 const SERVER = join(REPO_DIR, "server.mjs");
 const RESULTS_DIR = join(EVALS_DIR, "results");
-const PROMPTS_VERSION = 1; // bump when any prompt template below changes
+const PROMPTS_VERSION = 2; // bump when any prompt template below changes
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -57,12 +57,14 @@ const cfg = {
   noCache: flag("no-cache"),
   keepVault: flag("keep-vault"),
   bare: flag("bare"),
+  conv: opt("conv", null), // run a single conversation: 1-based index or id
+  qaConcurrency: Number(opt("qa-concurrency", 4)),
   ingestTimeoutMs: Number(opt("ingest-timeout", 300_000)),
   qaTimeoutMs: Number(opt("qa-timeout", 180_000)),
   judgeTimeoutMs: Number(opt("judge-timeout", 120_000)),
 };
 
-const configTag = `${cfg.suite}-${cfg.model}${cfg.bare ? "-bare" : ""}`;
+const configTag = `${cfg.suite}${cfg.conv ? `-c${cfg.conv}` : ""}-${cfg.model}${cfg.bare ? "-bare" : ""}`;
 const configHash = createHash("sha256")
   .update(JSON.stringify({ suite: cfg.suite, model: cfg.model, judge: cfg.judgeModel, bare: cfg.bare, PROMPTS_VERSION }))
   .digest("hex").slice(0, 12);
@@ -77,8 +79,44 @@ async function loadSuite(name) {
     const q = JSON.parse(await readFile(join(EVALS_DIR, "micro", "questions.json"), "utf8"));
     return { name, conversations: s.conversations, questions: q.questions };
   }
-  // locomo: Stage 1 — add a loader that downloads locomo10.json into
-  // evals/datasets/ (gitignored) and maps it to this same shape.
+  if (name === "locomo") {
+    const file = join(EVALS_DIR, "datasets", "locomo10.json");
+    if (!existsSync(file)) {
+      await mkdir(dirname(file), { recursive: true });
+      const res = await fetch("https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json");
+      if (!res.ok) throw new Error(`locomo download failed: HTTP ${res.status}`);
+      await writeFile(file, Buffer.from(await res.arrayBuffer()));
+    }
+    const data = JSON.parse(await readFile(file, "utf8"));
+    const CAT = { 1: "multi-hop", 2: "temporal", 3: "open-domain", 4: "single-hop", 5: "adversarial" };
+    const conversations = [], questions = [];
+    data.forEach((sample, i) => {
+      const c = sample.conversation;
+      const id = sample.sample_id ?? `conv-${i + 1}`;
+      const sessions = [];
+      for (let n = 1; c[`session_${n}`]; n++) {
+        sessions.push({
+          date: c[`session_${n}_date_time`],
+          transcript: c[`session_${n}`].map((t) => {
+            const photo = t.blip_caption ? ` [shares a photo: ${t.blip_caption}]` : "";
+            return `${t.speaker}:${photo} ${t.text ?? ""}`.trimEnd();
+          }),
+        });
+      }
+      conversations.push({ id, sessions });
+      sample.qa.forEach((qa, j) => questions.push({
+        id: `${id}-q${j}`,
+        conv: id,
+        category: CAT[qa.category] ?? `cat-${qa.category}`,
+        question: qa.question,
+        // Category 5 is adversarial/unanswerable — the gold sentinel routes it
+        // through the judge's abstention rule; the dataset's adversarial_answer
+        // is the trap, not the answer.
+        gold: qa.category === 5 ? "NOT_IN_MEMORY" : String(qa.answer),
+      }));
+    });
+    return { name, conversations, questions };
+  }
   throw new Error(`unknown suite: ${name}`);
 }
 
@@ -159,7 +197,7 @@ async function runClaude({ prompt, mcpUrl, allowedTools, model, timeoutMs, label
 // ── Prompts (versioned via PROMPTS_VERSION) ───────────────────────────────────
 
 const ingestPrompt = (session) =>
-  `A work session with the user is ending. Below is the complete transcript, dated ${session.date}.
+  `A session is ending. Below is its complete transcript, dated ${session.date}.
 Persist to your memory directory whatever your memory instructions say is worth persisting from this session. Do not answer the transcript; just do the memory work, then reply "done".
 
 --- TRANSCRIPT (${session.date}) ---
@@ -273,6 +311,12 @@ async function main() {
   workDir = await mkdtemp(join(tmpdir(), "vault-eval-work-"));
 
   const suite = await loadSuite(cfg.suite);
+  if (cfg.conv) {
+    suite.conversations = suite.conversations.filter((c, i) => String(i + 1) === cfg.conv || c.id === cfg.conv);
+    if (!suite.conversations.length) throw new Error(`--conv ${cfg.conv} matched nothing`);
+    const ids = new Set(suite.conversations.map((c) => c.id));
+    suite.questions = suite.questions.filter((q) => ids.has(q.conv));
+  }
   const today = new Date().toISOString().slice(0, 10);
 
   await emit({
@@ -296,31 +340,35 @@ async function main() {
   console.log(`server on :${server.port}, vault at ${memoryDir}`);
 
   try {
-    // ── Ingest ──
+    // ── Ingest (resumable per session: snapshot the vault after each one) ──
     for (const conv of suite.conversations) {
       const scopeDir = join(memoryDir, conv.id);
-      const snapshot = join(CACHE_DIR, `vault-${conv.id}.tgz`);
-      if (!cfg.noCache && existsSync(snapshot)) {
-        await mkdir(scopeDir, { recursive: true });
-        execSync(`tar -xzf "${snapshot}" -C "${scopeDir}"`);
-        console.log(`[ingest] ${conv.id}: restored from cache`);
-        await emit({ type: "ingest", conv: conv.id, fromCache: true });
+      const snapAt = (n) => join(CACHE_DIR, `vault-${conv.id}-s${n}.tgz`);
+      let start = 0;
+      if (!cfg.noCache)
+        for (let n = conv.sessions.length; n >= 1; n--)
+          if (existsSync(snapAt(n))) { start = n; break; }
+      await mkdir(scopeDir, { recursive: true });
+      if (start > 0) {
+        execSync(`tar -xzf "${snapAt(start)}" -C "${scopeDir}"`);
+        console.log(`[ingest] ${conv.id}: restored cache through session ${start}/${conv.sessions.length}`);
+        await emit({ type: "ingest", conv: conv.id, fromCache: true, throughSession: start });
       } else {
-        await mkdir(scopeDir, { recursive: true });
         await writeFile(join(scopeDir, "MEMORY.md"), `# Memory index — ${conv.id}\n\n`);
-        for (const [i, session] of conv.sessions.entries()) {
-          const r = await runClaude({
-            prompt: ingestPrompt(session),
-            mcpUrl: `${server.base}/mcp/${conv.id}`,
-            allowedTools: VAULT_TOOLS,
-            model: cfg.model,
-            timeoutMs: cfg.ingestTimeoutMs,
-            label: `ingest-${conv.id}-${i}`,
-          });
-          console.log(`[ingest] ${conv.id} session ${i + 1}/${conv.sessions.length} (${session.date}): ${r.numTurns} turns, $${r.costUsd?.toFixed(4)}`);
-          await emit({ type: "ingest", conv: conv.id, session: i, date: session.date, turns: r.numTurns, costUsd: r.costUsd, usage: r.usage, models: r.models, durationMs: r.durationMs, isError: r.isError });
-        }
-        execSync(`tar -czf "${snapshot}" -C "${scopeDir}" .`);
+      }
+      for (let i = start; i < conv.sessions.length; i++) {
+        const session = conv.sessions[i];
+        const r = await runClaude({
+          prompt: ingestPrompt(session),
+          mcpUrl: `${server.base}/mcp/${conv.id}`,
+          allowedTools: VAULT_TOOLS,
+          model: cfg.model,
+          timeoutMs: cfg.ingestTimeoutMs,
+          label: `ingest-${conv.id}-${i}`,
+        });
+        execSync(`tar -czf "${snapAt(i + 1)}" -C "${scopeDir}" .`);
+        console.log(`[ingest] ${conv.id} session ${i + 1}/${conv.sessions.length} (${session.date}): ${r.numTurns} turns, $${r.costUsd?.toFixed(4)}`);
+        await emit({ type: "ingest", conv: conv.id, session: i, date: session.date, turns: r.numTurns, costUsd: r.costUsd, usage: r.usage, models: r.models, durationMs: r.durationMs, isError: r.isError });
       }
       // Health + snapshot into results/
       const health = await healthCheck(scopeDir, suite.questions.filter((q) => q.conv === conv.id));
@@ -329,49 +377,67 @@ async function main() {
       execSync(`tar -czf "${join(RESULTS_DIR, `${configTag}-${conv.id}.vault.tgz`)}" -C "${scopeDir}" .`);
     }
 
-    // ── QA + judge ──
+    // ── QA + judge (worker pool; per-unit errors don't kill the run) ──
     const systems = ["vault", ...(cfg.baselines ? ["closed_book", "full_context"] : [])];
+    const units = suite.questions.flatMap((q) => systems.map((system) => ({ q, system })));
     const tally = {};
-    for (const q of suite.questions) {
-      const conv = suite.conversations.find((c) => c.id === q.conv);
-      for (const system of systems) {
-        const rec = await cached(`${q.id}-${system}`, async () => {
-          const prompt =
-            system === "vault" ? qaVaultPrompt(q, today) :
-            system === "closed_book" ? qaClosedBookPrompt(q, today) :
-            qaFullContextPrompt(q, today, conv);
-          const a = await runClaude({
-            prompt,
-            mcpUrl: system === "vault" ? `${server.base}/mcp/${q.conv}` : null,
-            allowedTools: system === "vault" ? ["mcp__vault__view"] : [], // QA is read-only
-            model: cfg.model,
-            timeoutMs: cfg.qaTimeoutMs,
-            label: `qa-${q.id}-${system}`,
+    let next = 0, done = 0;
+    const worker = async () => {
+      while (next < units.length) {
+        const { q, system } = units[next++];
+        const conv = suite.conversations.find((c) => c.id === q.conv);
+        let rec;
+        try {
+          rec = await cached(`${q.id}-${system}`, async () => {
+            const prompt =
+              system === "vault" ? qaVaultPrompt(q, today) :
+              system === "closed_book" ? qaClosedBookPrompt(q, today) :
+              qaFullContextPrompt(q, today, conv);
+            const a = await runClaude({
+              prompt,
+              mcpUrl: system === "vault" ? `${server.base}/mcp/${q.conv}` : null,
+              allowedTools: system === "vault" ? ["mcp__vault__view"] : [], // QA is read-only
+              model: cfg.model,
+              timeoutMs: cfg.qaTimeoutMs,
+              label: `qa-${q.id}-${system}`,
+            });
+            // Rate-limit/API/spend-limit failures come back as exit-0 "answers" —
+            // treat as errors (thrown = not cached) so they're retried, never judged.
+            const apiFail = /^API Error|spend limit|usage limit/i;
+            if (a.isError || apiFail.test(a.text ?? ""))
+              throw new Error(`qa call failed: ${String(a.text).slice(0, 150)}`);
+            const j = await runClaude({
+              prompt: judgePrompt(q, a.text),
+              mcpUrl: null, allowedTools: [],
+              model: cfg.judgeModel,
+              timeoutMs: cfg.judgeTimeoutMs,
+              label: `judge-${q.id}-${system}`,
+            });
+            if (j.isError || apiFail.test(j.text ?? ""))
+              throw new Error(`judge call failed: ${String(j.text).slice(0, 150)}`);
+            let verdict = { verdict: "unparseable", reason: j.text.slice(0, 200) };
+            const m = j.text.match(/\{[\s\S]*\}/);
+            if (m) { try { verdict = JSON.parse(m[0]); } catch {} }
+            return {
+              id: q.id, system, category: q.category, question: q.question, gold: q.gold,
+              answer: a.text, verdict: verdict.verdict, reason: verdict.reason,
+              qaTurns: a.numTurns, qaCostUsd: a.costUsd, qaUsage: a.usage, qaModels: a.models, qaDurationMs: a.durationMs,
+              judgeCostUsd: j.costUsd, judgeModels: j.models,
+            };
           });
-          const j = await runClaude({
-            prompt: judgePrompt(q, a.text),
-            mcpUrl: null, allowedTools: [],
-            model: cfg.judgeModel,
-            timeoutMs: cfg.judgeTimeoutMs,
-            label: `judge-${q.id}-${system}`,
-          });
-          let verdict = { verdict: "unparseable", reason: j.text.slice(0, 200) };
-          const m = j.text.match(/\{[\s\S]*\}/);
-          if (m) { try { verdict = JSON.parse(m[0]); } catch {} }
-          return {
-            id: q.id, system, category: q.category, question: q.question, gold: q.gold,
-            answer: a.text, verdict: verdict.verdict, reason: verdict.reason,
-            qaTurns: a.numTurns, qaCostUsd: a.costUsd, qaUsage: a.usage, qaModels: a.models, qaDurationMs: a.durationMs,
-            judgeCostUsd: j.costUsd, judgeModels: j.models,
-          };
-        });
+        } catch (e) {
+          rec = { id: q.id, system, category: q.category, question: q.question, gold: q.gold, answer: null, verdict: "error", reason: String(e).slice(0, 300) };
+        }
         await emit({ type: "result", ...rec });
-        tally[system] ??= { correct: 0, total: 0 };
+        tally[system] ??= { correct: 0, total: 0, errors: 0 };
         tally[system].total++;
         if (rec.verdict === "correct") tally[system].correct++;
-        console.log(`[qa] ${q.id} ${system}: ${rec.verdict}${rec.fromCache ? " (cached)" : ""} — ${String(rec.answer).slice(0, 80).replace(/\n/g, " ")}`);
+        if (rec.verdict === "error") tally[system].errors++;
+        done++;
+        console.log(`[qa ${done}/${units.length}] ${q.id} ${system}: ${rec.verdict}${rec.fromCache ? " (cached)" : ""} — ${String(rec.answer).slice(0, 80).replace(/\n/g, " ")}`);
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, cfg.qaConcurrency) }, worker));
 
     await emit({ type: "summary", tally, date: new Date().toISOString() });
     console.log("\n== summary ==");
