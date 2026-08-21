@@ -1,6 +1,6 @@
 {
   "name": "memory-vault",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "mcpName": "io.github.apurv101/memory-vault",
   "description": "Claude-style memory over a local folder, served via MCP — per-project spaces plus a shared org layer. Harness-neutral, customer-owned.",
   "type": "module",

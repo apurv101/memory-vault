@@ -30,28 +30,46 @@ A project connection can access its own directory and `shared/`, but not other p
 
 Memory Vault has no runtime dependencies.
 
-## Connect a repository
+## Install into a repository
 
 Run this from the repository you want to connect:
 
 ```sh
-npx -y memory-vault connect
+npx -y memory-vault install
 ```
 
 This command:
 
 1. Starts the local server if it is not already running.
-2. Creates a project-scoped MCP connection.
-3. Adds the memory instructions the detected agent harness needs.
+2. Asks which harnesses to wire up, with the detected ones pre-selected (interactive terminals only — everywhere else the detected set is used as is).
+3. Writes each chosen harness's MCP config and the shared rules files.
 
-By default, `connect` stores memory in `~/.memory-vault` and derives the project name from the current directory.
+By default, `install` stores memory in `~/.memory-vault` and derives the project name from the current directory. `connect` is an alias for `install`.
 
 ```sh
-npx -y memory-vault connect --dry-run          # preview changes
-npx -y memory-vault connect --project my-app  # choose the project name
+npx -y memory-vault install --dry-run                # preview changes
+npx -y memory-vault install --project my-app         # choose the project name
+npx -y memory-vault install --harness claude,codex   # skip the prompt, pick explicitly
+npx -y memory-vault install --yes                    # skip the prompt, accept detected
 ```
 
-Restart your agent session after connecting and approve the `vault` MCP server if prompted.
+Restart your agent session after installing and approve the `vault` MCP server if prompted.
+
+## Uninstall from a repository
+
+```sh
+npx -y memory-vault uninstall
+```
+
+Removes everything `install` wrote to the repository — the MCP entries, the rules sections, the dsh patch — deleting a file only when it held nothing else. Your memories are never touched, and the server keeps running for other projects. `disconnect` is an alias for `uninstall`.
+
+## Check the wiring
+
+```sh
+npx -y memory-vault status
+```
+
+Shows whether the server is up and which store it serves, how the current repository is wired per harness, and every repository recorded by `install` (kept in `~/.memory-vault-connections.json`). If the server is up and the repo is wired but your agent session has no vault tools, the remaining cause is session attachment — `status` prints how to fix it.
 
 ### Supported harnesses
 

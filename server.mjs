@@ -2,9 +2,12 @@
 // Memory Vault — Claude-style memory primitives over a local folder, via MCP.
 //
 //   node server.mjs                (or: npm start) — serve the vault
-//   npx memory-vault connect       — wire the current repo to the vault
-//                                    (starts the server if down, writes each
-//                                    detected harness's MCP config + rules file)
+//   npx memory-vault install       — wire the current repo to the vault
+//                                    (starts the server if down, lets you pick
+//                                    harnesses, writes each one's MCP config +
+//                                    the shared rules files; alias: connect)
+//   npx memory-vault uninstall     — undo install for the repo; memories are
+//                                    never touched (alias: disconnect)
 //
 // The store is a plain directory of markdown files (default ./memory), one
 // subdirectory per project plus an org-wide shared/ space, each with its own
@@ -32,6 +35,7 @@ import {
   writeFile,
   rename as fsRename,
   rm,
+  rmdir,
   stat,
 } from "node:fs/promises";
 import { openSync } from "node:fs";
@@ -44,7 +48,7 @@ const MEMORY_DIR = resolve(process.env.MEMORY_DIR ?? "./memory");
 const PORT = Number(process.env.VAULT_PORT ?? 8787);
 
 const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INFO = { name: "memory-vault", version: "0.3.0" };
+const SERVER_INFO = { name: "memory-vault", version: "0.3.1" };
 
 const instructionsFor = (scope) =>
   scope
@@ -380,6 +384,38 @@ const MEMORY_SECTION = `## Memory
 This repo uses the vault MCP server (\`vault\`) for persistent memory. At session start, view \`MEMORY.md\` with the vault tools and read any entries relevant to the task. Before finishing, save durable facts, corrections, lessons, and decisions to the vault — one markdown file per fact with \`name:\`/\`description:\` frontmatter — and add or update its line in \`MEMORY.md\`. Check whether an existing memory already covers it before creating a new one. Facts that apply beyond this project go in \`shared/\` (update \`shared/MEMORY.md\`). Prefer the vault over any built-in auto-memory.
 `;
 
+// Markers around the written section let uninstall remove it verbatim even if
+// the section text changes in a future version. (Sections written before the
+// markers existed are removed by exact-text match instead.)
+const MARK_BEGIN = "<!-- memory-vault:begin -->";
+const MARK_END = "<!-- memory-vault:end -->";
+const MARKED_SECTION = `${MARK_BEGIN}\n${MEMORY_SECTION}${MARK_END}\n`;
+
+const projectSlug = (name) =>
+  name
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, 64);
+
+// Machine-level record of which repos ran install — advisory, not
+// authoritative (repos move and vanish), so readers treat entries as hints.
+// Lives outside the store: it describes this machine's wiring, not memories.
+const CONNECTIONS_PATH = join(homedir(), ".memory-vault-connections.json");
+
+async function readConnections() {
+  try {
+    const parsed = JSON.parse(await readFile(CONNECTIONS_PATH, "utf8"));
+    return Array.isArray(parsed.connections) ? parsed.connections : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeConnections(connections) {
+  await writeFile(CONNECTIONS_PATH, JSON.stringify({ connections }, null, 2) + "\n");
+}
+
 async function serverUp() {
   try {
     await fetch(`http://127.0.0.1:${PORT}/`, { signal: AbortSignal.timeout(1000) });
@@ -412,22 +448,278 @@ async function mergeMcpJson(path, entry, dryRun) {
   return status;
 }
 
-async function connect(argv) {
+// Reverse of mergeMcpJson: drop the vault entry, delete the file if that was
+// all it held. Returns a status string for the report.
+async function removeMcpJson(path, dryRun) {
+  const raw = await readFile(path, "utf8").catch(() => null);
+  if (raw === null) return "not present";
+  let config;
+  try {
+    config = JSON.parse(raw);
+  } catch {
+    return "not valid JSON — remove the vault entry by hand";
+  }
+  if (!config.mcpServers?.vault) return "no vault entry";
+  delete config.mcpServers.vault;
+  const empty = Object.keys(config).length === 1 && Object.keys(config.mcpServers).length === 0;
+  if (!dryRun) {
+    if (empty) await rm(path);
+    else await writeFile(path, JSON.stringify(config, null, 2) + "\n");
+  }
+  return empty ? "deleted (only held the vault entry)" : "vault entry removed";
+}
+
+// ── harness registry ──────────────────────────────────────────────────────────
+//
+// Each harness owns three hooks: detect (is it on this machine / in this
+// repo), install (write its MCP registration), and uninstall (remove exactly
+// what install wrote, leaving the repo as it was). The shared rules files
+// (AGENTS.md + CLAUDE.md) are a separate step because every harness reads the
+// same ritual text. Adding a harness = adding one entry here.
+
+const HARNESSES = [
+  {
+    key: "claude",
+    title: "Claude Code",
+    where: ".mcp.json",
+    // .mcp.json is the repo-level MCP convention, useful beyond Claude Code —
+    // always on.
+    detect: async () => true,
+    async install({ cwd, url, dryRun }) {
+      const status = await mergeMcpJson(join(cwd, ".mcp.json"), { type: "http", url }, dryRun);
+      return [`claude   .mcp.json ${status} (vault → ${url})`];
+    },
+    async uninstall({ cwd, dryRun }) {
+      return [`claude   .mcp.json ${await removeMcpJson(join(cwd, ".mcp.json"), dryRun)}`];
+    },
+  },
+  {
+    key: "cursor",
+    title: "Cursor",
+    where: ".cursor/mcp.json",
+    detect: async (cwd) => (await exists(join(homedir(), ".cursor"))) || (await exists(join(cwd, ".cursor"))),
+    async install({ cwd, url, dryRun }) {
+      const status = await mergeMcpJson(join(cwd, ".cursor", "mcp.json"), { url }, dryRun);
+      return [`cursor   .cursor/mcp.json ${status}`];
+    },
+    async uninstall({ cwd, dryRun }) {
+      const status = await removeMcpJson(join(cwd, ".cursor", "mcp.json"), dryRun);
+      if (!dryRun && status.startsWith("deleted")) await rmdir(join(cwd, ".cursor")).catch(() => {});
+      return [`cursor   .cursor/mcp.json ${status}`];
+    },
+  },
+  {
+    key: "codex",
+    title: "Codex CLI",
+    where: ".codex/config.toml",
+    detect: async (cwd) => (await exists(join(homedir(), ".codex"))) || (await exists(join(cwd, ".codex"))),
+    async install({ cwd, url, dryRun }) {
+      // Project-scoped Codex config (trusted projects). TOML is appended, not
+      // parsed — if a vault block already exists we only verify the URL.
+      const tomlPath = join(cwd, ".codex", "config.toml");
+      const toml = await readFile(tomlPath, "utf8").catch(() => null);
+      if (toml === null || !toml.includes("[mcp_servers.vault]")) {
+        if (!dryRun) {
+          await mkdir(dirname(tomlPath), { recursive: true });
+          await writeFile(tomlPath, `${toml?.trimEnd() ? toml.trimEnd() + "\n\n" : ""}[mcp_servers.vault]\nurl = "${url}"\n`);
+        }
+        return [`codex    .codex/config.toml ${toml === null ? "created" : "updated"} (trusted projects only)`];
+      }
+      return [
+        toml.includes(`url = "${url}"`)
+          ? "codex    .codex/config.toml unchanged"
+          : `codex    .codex/config.toml already has a vault entry with a different url — update it by hand to ${url}`,
+      ];
+    },
+    async uninstall({ cwd, dryRun }) {
+      const tomlPath = join(cwd, ".codex", "config.toml");
+      const toml = await readFile(tomlPath, "utf8").catch(() => null);
+      if (toml === null) return ["codex    .codex/config.toml not present"];
+      if (!toml.includes("[mcp_servers.vault]")) return ["codex    .codex/config.toml no vault entry"];
+      const cleaned = toml.replace(/(?:^|\n)\[mcp_servers\.vault\]\n(?:(?!\[).*(?:\n|$))*/, "\n").replace(/^\n+/, "");
+      if (cleaned.trim() === "") {
+        if (!dryRun) {
+          await rm(tomlPath);
+          await rmdir(join(cwd, ".codex")).catch(() => {});
+        }
+        return ["codex    .codex/config.toml deleted (only held the vault entry)"];
+      }
+      if (!dryRun) await writeFile(tomlPath, cleaned.trimEnd() + "\n");
+      return ["codex    .codex/config.toml vault entry removed"];
+    },
+  },
+  {
+    key: "dsh",
+    title: "DeepSeek Harness",
+    where: "dsh-cordis.patch.yml",
+    detect: async () => exists(join(homedir(), ".dsh")),
+    async install({ cwd, url, project, dryRun }) {
+      // Repo-local Cordis patch with the project-scoped URL. dsh has no repo-level
+      // auto-loaded config, so the patch is applied per-session via --patch (or
+      // copied into a profile to make it permanent — the file header says how).
+      const patchPath = join(cwd, "dsh-cordis.patch.yml");
+      const patchEntry = `- id: mcp-vault\n  name: '@deepseek-ai/dsh-mcp-client'\n  config:\n    serverName: vault\n    transport: streamable-http\n    url: ${url}\n`;
+      const patchContent = `# dsh Cordis patch — load the memory-vault MCP server (project "${project}").\n# Per-session:  dsh --patch ./dsh-cordis.patch.yml [--profile <name>] ["your task"]\n# Permanent:    copy the entry below into ~/.dsh/profiles/<name>/cordis.patch.yml\n# The vault server must be running (npx memory-vault install starts it if down).\n${patchEntry}`;
+      const patch = await readFile(patchPath, "utf8").catch(() => null);
+      if (patch === patchContent || (patch !== null && patch.includes("id: mcp-vault") && patch.includes(`url: ${url}`))) {
+        return ["dsh      dsh-cordis.patch.yml unchanged — run: dsh --patch ./dsh-cordis.patch.yml"];
+      }
+      if (patch !== null && patch.includes("id: mcp-vault")) {
+        return [`dsh      dsh-cordis.patch.yml already has a vault entry with a different url — update it by hand to ${url}`];
+      }
+      if (patch !== null) {
+        if (!dryRun) await writeFile(patchPath, `${patch.trimEnd()}\n\n${patchEntry}`);
+        return ["dsh      dsh-cordis.patch.yml updated — run: dsh --patch ./dsh-cordis.patch.yml"];
+      }
+      if (!dryRun) await writeFile(patchPath, patchContent);
+      return ["dsh      dsh-cordis.patch.yml created — run: dsh --patch ./dsh-cordis.patch.yml"];
+    },
+    async uninstall({ cwd, dryRun }) {
+      const patchPath = join(cwd, "dsh-cordis.patch.yml");
+      const patch = await readFile(patchPath, "utf8").catch(() => null);
+      if (patch === null) return ["dsh      dsh-cordis.patch.yml not present"];
+      if (!patch.includes("id: mcp-vault")) return ["dsh      dsh-cordis.patch.yml no vault entry"];
+      const cleaned = patch.replace(/(?:^|\n)- id: mcp-vault\n(?:[ \t].*(?:\n|$))*/, "\n");
+      const onlyComments = cleaned.split("\n").every((l) => l.trim() === "" || l.trim().startsWith("#"));
+      if (onlyComments) {
+        if (!dryRun) await rm(patchPath);
+        return ["dsh      dsh-cordis.patch.yml deleted"];
+      }
+      if (!dryRun) await writeFile(patchPath, cleaned.trimEnd() + "\n");
+      return ["dsh      dsh-cordis.patch.yml vault entry removed"];
+    },
+  },
+];
+
+// The ritual. AGENTS.md carries it (Codex, Cursor, and the growing
+// cross-harness convention); CLAUDE.md imports it via @AGENTS.md so the
+// text lives in one place.
+async function installRules({ cwd, project, dryRun }) {
+  const lines = [];
+  const agentsPath = join(cwd, "AGENTS.md");
+  const agents = await readFile(agentsPath, "utf8").catch(() => null);
+  if (agents === null) {
+    if (!dryRun) await writeFile(agentsPath, `# ${project}\n\n${MARKED_SECTION}`);
+    lines.push("rules    AGENTS.md created with the memory section");
+  } else if (!/vault/i.test(agents)) {
+    if (!dryRun) await writeFile(agentsPath, `${agents.trimEnd()}\n\n${MARKED_SECTION}`);
+    lines.push("rules    AGENTS.md memory section appended");
+  } else {
+    lines.push("rules    AGENTS.md unchanged");
+  }
+
+  const claudeMdPath = join(cwd, "CLAUDE.md");
+  const claudeMd = await readFile(claudeMdPath, "utf8").catch(() => null);
+  if (claudeMd === null) {
+    if (!dryRun) await writeFile(claudeMdPath, "@AGENTS.md\n");
+    lines.push("rules    CLAUDE.md created (imports @AGENTS.md)");
+  } else if (!/vault/i.test(claudeMd) && !claudeMd.includes("@AGENTS.md")) {
+    if (!dryRun) await writeFile(claudeMdPath, `${claudeMd.trimEnd()}\n\n@AGENTS.md\n`);
+    lines.push("rules    CLAUDE.md @AGENTS.md import appended");
+  } else {
+    lines.push("rules    CLAUDE.md unchanged");
+  }
+  return lines;
+}
+
+async function uninstallRules({ cwd, project, dryRun }) {
+  const lines = [];
+  const agentsPath = join(cwd, "AGENTS.md");
+  const agents = await readFile(agentsPath, "utf8").catch(() => null);
+  let sectionRemoved = false;
+  let agentsDeleted = false;
+  if (agents === null) {
+    lines.push("rules    AGENTS.md not present");
+  } else {
+    // Marker-delimited sections first (written by install going forward),
+    // exact text of the current section as fallback for older installs.
+    const marked = /(?:^|\n)<!-- memory-vault:begin -->\n[\s\S]*?<!-- memory-vault:end -->\n?/;
+    let cleaned = null;
+    if (marked.test(agents)) cleaned = agents.replace(marked, "\n");
+    else if (agents.includes(MEMORY_SECTION)) cleaned = agents.replace(MEMORY_SECTION, "");
+    if (cleaned === null) {
+      lines.push(
+        /vault/i.test(agents)
+          ? "rules    AGENTS.md mentions the vault but not the standard section — edit by hand"
+          : "rules    AGENTS.md no memory section",
+      );
+    } else {
+      sectionRemoved = true;
+      const rest = cleaned.trim();
+      if (rest === "" || rest === `# ${project}`) {
+        if (!dryRun) await rm(agentsPath);
+        agentsDeleted = true;
+        lines.push("rules    AGENTS.md deleted (only held the memory section)");
+      } else {
+        if (!dryRun) await writeFile(agentsPath, cleaned.replace(/\n{3,}/g, "\n\n").trim() + "\n");
+        lines.push("rules    AGENTS.md memory section removed");
+      }
+    }
+  }
+
+  const claudeMdPath = join(cwd, "CLAUDE.md");
+  const claudeMd = await readFile(claudeMdPath, "utf8").catch(() => null);
+  if (claudeMd === null) {
+    lines.push("rules    CLAUDE.md not present");
+  } else if (claudeMd.trim() === "@AGENTS.md" && (agentsDeleted || sectionRemoved)) {
+    if (!dryRun) await rm(claudeMdPath);
+    lines.push("rules    CLAUDE.md deleted (only imported AGENTS.md)");
+  } else if ((agentsDeleted || sectionRemoved) && /\n@AGENTS\.md\s*$/.test(claudeMd)) {
+    if (!dryRun) await writeFile(claudeMdPath, claudeMd.replace(/\n+@AGENTS\.md\s*$/, "\n"));
+    lines.push("rules    CLAUDE.md @AGENTS.md import removed");
+  } else if (/vault/i.test(claudeMd)) {
+    lines.push("rules    CLAUDE.md mentions the vault — review by hand");
+  } else {
+    lines.push("rules    CLAUDE.md unchanged");
+  }
+  return lines;
+}
+
+// Interactive harness picker — plain readline, no dependencies. Only used
+// when stdin/stdout are a terminal and no --harness/--yes flag was given.
+async function pickHarnesses(detected) {
+  console.log("Harnesses to wire to the vault:\n");
+  HARNESSES.forEach((h, i) => {
+    const mark = detected.includes(h.key) ? "detected" : "not detected";
+    console.log(`  ${i + 1}. ${h.key.padEnd(8)} ${h.title.padEnd(18)} ${h.where.padEnd(24)} ${mark}`);
+  });
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (
+    await rl.question(`\nInstall for [${detected.join(", ")}] — Enter to accept, or list keys/numbers, or "all": `)
+  ).trim();
+  rl.close();
+  if (answer === "") return detected;
+  if (answer.toLowerCase() === "all") return HARNESSES.map((h) => h.key);
+  const keys = [];
+  for (const tok of answer.split(/[,\s]+/).filter(Boolean)) {
+    const h = /^\d+$/.test(tok) ? HARNESSES[Number(tok) - 1] : HARNESSES.find((x) => x.key === tok.toLowerCase());
+    if (!h) throw new Error(`unknown harness: ${tok} (known: ${HARNESSES.map((x) => x.key).join(", ")})`);
+    if (!keys.includes(h.key)) keys.push(h.key);
+  }
+  return keys;
+}
+
+async function install(argv) {
   let project = null;
   let dryRun = false;
+  let harnessFlag = null;
+  let yes = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--project") project = argv[++i];
     else if (argv[i] === "--dry-run") dryRun = true;
-    else throw new Error(`unknown flag: ${argv[i]} (usage: memory-vault connect [--project <name>] [--dry-run])`);
+    else if (argv[i] === "--harness") harnessFlag = argv[++i];
+    else if (argv[i] === "--yes" || argv[i] === "-y") yes = true;
+    else
+      throw new Error(
+        `unknown flag: ${argv[i]} (usage: memory-vault install [--project <name>] [--harness <keys>] [--yes] [--dry-run])`,
+      );
   }
   const cwd = process.cwd();
-  project = (project ?? basename(cwd))
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^[^a-z0-9]+/, "")
-    .slice(0, 64);
+  project = projectSlug(project ?? basename(cwd));
   if (!project) throw new Error("could not derive a project name from the directory — pass --project <name>");
   const url = `http://localhost:${PORT}/mcp/${project}`;
+  const ctx = { cwd, url, project, dryRun };
   const lines = [];
 
   // 1. The server. If it's already up it keeps its own MEMORY_DIR; only a
@@ -449,112 +741,157 @@ async function connect(argv) {
     lines.push(`server   started on port ${PORT} (store: ${storeDir}, log: ${join(tmpdir(), "memory-vault.log")})`);
   }
 
-  // 2. MCP registration, one config per harness. Claude Code's .mcp.json is
-  // always written — it's the repo-level MCP convention; the others only when
-  // the harness is installed (user-level dotdir) or already used in this repo.
-  const claudeStatus = await mergeMcpJson(join(cwd, ".mcp.json"), { type: "http", url }, dryRun);
-  lines.push(`claude   .mcp.json ${claudeStatus} (vault → ${url})`);
-
-  if ((await exists(join(homedir(), ".cursor"))) || (await exists(join(cwd, ".cursor")))) {
-    const status = await mergeMcpJson(join(cwd, ".cursor", "mcp.json"), { url }, dryRun);
-    lines.push(`cursor   .cursor/mcp.json ${status}`);
-  } else {
-    lines.push("cursor   not detected — skipped");
-  }
-
-  if ((await exists(join(homedir(), ".codex"))) || (await exists(join(cwd, ".codex")))) {
-    // Project-scoped Codex config (trusted projects). TOML is appended, not
-    // parsed — if a vault block already exists we only verify the URL.
-    const tomlPath = join(cwd, ".codex", "config.toml");
-    const toml = await readFile(tomlPath, "utf8").catch(() => null);
-    if (toml === null || !toml.includes("[mcp_servers.vault]")) {
-      if (!dryRun) {
-        await mkdir(dirname(tomlPath), { recursive: true });
-        await writeFile(tomlPath, `${toml?.trimEnd() ? toml.trimEnd() + "\n\n" : ""}[mcp_servers.vault]\nurl = "${url}"\n`);
-      }
-      lines.push(`codex    .codex/config.toml ${toml === null ? "created" : "updated"} (trusted projects only)`);
-    } else {
-      lines.push(
-        toml.includes(`url = "${url}"`)
-          ? "codex    .codex/config.toml unchanged"
-          : `codex    .codex/config.toml already has a vault entry with a different url — update it by hand to ${url}`,
-      );
+  // 2. Pick harnesses: --harness wins; otherwise the detected set, confirmed
+  // interactively when there's a terminal to ask.
+  const detected = [];
+  for (const h of HARNESSES) if (await h.detect(cwd)) detected.push(h.key);
+  let selected;
+  if (harnessFlag !== null) {
+    selected = harnessFlag.split(/[,\s]+/).filter(Boolean);
+    for (const key of selected) {
+      if (!HARNESSES.some((h) => h.key === key))
+        throw new Error(`unknown harness: ${key} (known: ${HARNESSES.map((h) => h.key).join(", ")})`);
     }
+  } else if (yes || dryRun || !process.stdin.isTTY || !process.stdout.isTTY) {
+    selected = detected;
   } else {
-    lines.push("codex    not detected — skipped");
+    selected = await pickHarnesses(detected);
   }
 
-  if (await exists(join(homedir(), ".dsh"))) {
-    // Repo-local Cordis patch with the project-scoped URL. dsh has no repo-level
-    // auto-loaded config, so the patch is applied per-session via --patch (or
-    // copied into a profile to make it permanent — the file header says how).
-    const patchPath = join(cwd, "dsh-cordis.patch.yml");
-    const patchEntry = `- id: mcp-vault\n  name: '@deepseek-ai/dsh-mcp-client'\n  config:\n    serverName: vault\n    transport: streamable-http\n    url: ${url}\n`;
-    const patchContent = `# dsh Cordis patch — load the memory-vault MCP server (project "${project}").\n# Per-session:  dsh --patch ./dsh-cordis.patch.yml [--profile <name>] ["your task"]\n# Permanent:    copy the entry below into ~/.dsh/profiles/<name>/cordis.patch.yml\n# The vault server must be running (npx memory-vault connect starts it if down).\n${patchEntry}`;
-    const patch = await readFile(patchPath, "utf8").catch(() => null);
-    if (patch === patchContent || (patch !== null && patch.includes("id: mcp-vault") && patch.includes(`url: ${url}`))) {
-      lines.push("dsh      dsh-cordis.patch.yml unchanged — run: dsh --patch ./dsh-cordis.patch.yml");
-    } else if (patch !== null && patch.includes("id: mcp-vault")) {
-      lines.push(`dsh      dsh-cordis.patch.yml already has a vault entry with a different url — update it by hand to ${url}`);
-    } else if (patch !== null) {
-      if (!dryRun) await writeFile(patchPath, `${patch.trimEnd()}\n\n${patchEntry}`);
-      lines.push("dsh      dsh-cordis.patch.yml updated — run: dsh --patch ./dsh-cordis.patch.yml");
-    } else {
-      if (!dryRun) await writeFile(patchPath, patchContent);
-      lines.push("dsh      dsh-cordis.patch.yml created — run: dsh --patch ./dsh-cordis.patch.yml");
-    }
+  // 3. MCP registration for each selected harness, then the shared ritual.
+  for (const h of HARNESSES) {
+    if (selected.includes(h.key)) lines.push(...(await h.install(ctx)));
+    else lines.push(`${h.key.padEnd(9)}${detected.includes(h.key) ? "skipped" : "not detected — skipped"}`);
+  }
+  if (selected.length > 0) lines.push(...(await installRules(ctx)));
+
+  // 4. Record the connection so status / a future uninstall --all can find it.
+  if (selected.length > 0 && !dryRun) {
+    const connections = (await readConnections()).filter((c) => c.repo !== cwd);
+    connections.push({ repo: cwd, project, url, harnesses: selected, installedAt: new Date().toISOString() });
+    await writeConnections(connections);
+    lines.push(`registry ${CONNECTIONS_PATH} recorded`);
   }
 
-  // 3. The ritual. AGENTS.md carries it (Codex, Cursor, and the growing
-  // cross-harness convention); CLAUDE.md imports it via @AGENTS.md so the
-  // text lives in one place.
-  const agentsPath = join(cwd, "AGENTS.md");
-  const agents = await readFile(agentsPath, "utf8").catch(() => null);
-  if (agents === null) {
-    if (!dryRun) await writeFile(agentsPath, `# ${project}\n\n${MEMORY_SECTION}`);
-    lines.push("rules    AGENTS.md created with the memory section");
-  } else if (!/vault/i.test(agents)) {
-    if (!dryRun) await writeFile(agentsPath, `${agents.trimEnd()}\n\n${MEMORY_SECTION}`);
-    lines.push("rules    AGENTS.md memory section appended");
-  } else {
-    lines.push("rules    AGENTS.md unchanged");
-  }
-
-  const claudeMdPath = join(cwd, "CLAUDE.md");
-  const claudeMd = await readFile(claudeMdPath, "utf8").catch(() => null);
-  if (claudeMd === null) {
-    if (!dryRun) await writeFile(claudeMdPath, "@AGENTS.md\n");
-    lines.push("rules    CLAUDE.md created (imports @AGENTS.md)");
-  } else if (!/vault/i.test(claudeMd) && !claudeMd.includes("@AGENTS.md")) {
-    if (!dryRun) await writeFile(claudeMdPath, `${claudeMd.trimEnd()}\n\n@AGENTS.md\n`);
-    lines.push("rules    CLAUDE.md @AGENTS.md import appended");
-  } else {
-    lines.push("rules    CLAUDE.md unchanged");
-  }
-
-  console.log(`memory-vault connect — project "${project}"${dryRun ? " (dry run)" : ""}\n`);
+  console.log(`memory-vault install — project "${project}"${dryRun ? " (dry run)" : ""}\n`);
   for (const l of lines) console.log(`  ${l}`);
   console.log("\nRestart your session and approve the vault MCP server when prompted.");
 }
 
+async function uninstall(argv) {
+  let project = null;
+  let dryRun = false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--project") project = argv[++i];
+    else if (argv[i] === "--dry-run") dryRun = true;
+    else throw new Error(`unknown flag: ${argv[i]} (usage: memory-vault uninstall [--project <name>] [--dry-run])`);
+  }
+  const cwd = process.cwd();
+  project = projectSlug(project ?? basename(cwd));
+  const ctx = { cwd, project, dryRun };
+  const lines = [];
+  for (const h of HARNESSES) lines.push(...(await h.uninstall(ctx)));
+  lines.push(...(await uninstallRules(ctx)));
+
+  const connections = await readConnections();
+  if (connections.some((c) => c.repo === cwd)) {
+    if (!dryRun) await writeConnections(connections.filter((c) => c.repo !== cwd));
+    lines.push("registry connection entry removed");
+  } else {
+    lines.push("registry no entry for this repo");
+  }
+
+  console.log(`memory-vault uninstall — project "${project}"${dryRun ? " (dry run)" : ""}\n`);
+  for (const l of lines) console.log(`  ${l}`);
+  console.log(
+    "\nYour memories are untouched — the store stays in the vault directory (default ~/.memory-vault).\n" +
+      "The server keeps running for other projects; restart your agent session to drop the vault tools.",
+  );
+}
+
 // ── CLI dispatch ──────────────────────────────────────────────────────────────
+
+// status — the three-layer diagnosis: server up? repo wired? and if both,
+// the remaining failure mode is session attachment, which only a session
+// restart / approval can fix, so say exactly that.
+async function status() {
+  const cwd = process.cwd();
+  console.log("memory-vault status\n");
+
+  let banner = null;
+  try {
+    const res = await fetch(`http://127.0.0.1:${PORT}/`, { signal: AbortSignal.timeout(1500) });
+    banner = (await res.text()).trim().split("\n")[0];
+  } catch {}
+  console.log(
+    banner !== null
+      ? `  server   up on port ${PORT} — ${banner}`
+      : `  server   down (port ${PORT}) — start it: npx memory-vault install (or serve)`,
+  );
+
+  console.log(`\n  this repo (${cwd}):`);
+  for (const h of HARNESSES) {
+    const raw = await readFile(join(cwd, h.where), "utf8").catch(() => null);
+    const state = raw === null ? "not present" : /vault/i.test(raw) ? "wired" : "present, no vault entry";
+    console.log(`  ${h.key.padEnd(9)}${h.where} ${state}`);
+  }
+  const agents = await readFile(join(cwd, "AGENTS.md"), "utf8").catch(() => null);
+  console.log(
+    `  rules    AGENTS.md ${agents === null ? "not present" : /vault/i.test(agents) ? "has the memory section" : "no memory section"}`,
+  );
+
+  const connections = await readConnections();
+  if (connections.length === 0) {
+    console.log("\n  connected repos: none recorded (installs record here from v0.3.1 on)");
+  } else {
+    console.log(`\n  connected repos (${connections.length}):`);
+    for (const c of connections) {
+      const there = await exists(c.repo);
+      console.log(`    ${c.repo} → ${c.project}${there ? "" : "  (missing — moved or deleted)"}`);
+    }
+  }
+
+  console.log(
+    "\n  If the server is up and the repo is wired but your agent session has no vault\n" +
+      "  tools: MCP servers attach at session start — restart the session and approve\n" +
+      "  the vault server. Claude Code remembers a declined approval: run /mcp in the\n" +
+      "  session, or `claude mcp reset-project-choices` in the repo, then restart.",
+  );
+}
 
 const USAGE = `memory-vault — Claude-style memory over a local folder, via MCP
 
-  memory-vault [serve]     serve the vault (MEMORY_DIR, VAULT_PORT)
-  memory-vault connect     wire the current repo to the vault:
-                           start the server if down, write each detected
-                           harness's MCP config and rules file
-                           [--project <name>] [--dry-run]`;
+  memory-vault [serve]      serve the vault (MEMORY_DIR, VAULT_PORT)
+  memory-vault install      wire the current repo to the vault: start the
+                            server if down, pick harnesses (interactive in
+                            a terminal), write each one's MCP config and
+                            the shared rules files      (alias: connect)
+                            [--project <name>] [--harness <keys>] [--yes] [--dry-run]
+  memory-vault uninstall    undo install for this repo: remove the vault
+                            wiring from every harness config and rules
+                            file; memories are never touched
+                                                        (alias: disconnect)
+                            [--project <name>] [--dry-run]
+  memory-vault status       show server state, this repo's wiring, and every
+                            repo recorded by install`;
 
 const cmd = process.argv[2];
-if (cmd === "connect") {
+if (cmd === "install" || cmd === "connect") {
   try {
-    await connect(process.argv.slice(3));
+    await install(process.argv.slice(3));
   } catch (err) {
-    console.error(`memory-vault connect: ${err.message}`);
+    console.error(`memory-vault install: ${err.message}`);
     process.exit(1);
   }
+} else if (cmd === "uninstall" || cmd === "disconnect") {
+  try {
+    await uninstall(process.argv.slice(3));
+  } catch (err) {
+    console.error(`memory-vault uninstall: ${err.message}`);
+    process.exit(1);
+  }
+} else if (cmd === "status") {
+  await status();
 } else if (cmd === undefined || cmd === "serve") {
   await mkdir(MEMORY_DIR, { recursive: true });
   server.listen(PORT, "127.0.0.1", () => {
