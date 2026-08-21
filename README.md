@@ -119,9 +119,7 @@ The server instructs agents to check for an existing memory before creating one,
 
 ## Current scope
 
-The current release is a local Markdown store, an MCP interface, and a cross-harness setup command.
-
-Automatic extraction, semantic search, programmatic deduplication, contradiction resolution, provenance, review queues, authentication, and remote deployment are not implemented. They are possible future directions, described in [the roadmap](docs/roadmap.md) and [architecture sketch](docs/architecture.md).
+The current release is a local Markdown store, an MCP interface, and a cross-harness setup command. There is no automatic extraction, semantic search, deduplication, authentication, or remote deployment.
 
 ## Package
 
