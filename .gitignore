@@ -14,8 +14,8 @@ build/
 # Node
 node_modules/
 
-# Soft-deleted memories
-memory/.trash/
+# The memory store — vault contents must never enter the repo
+memory/
 
 # OS / editors
 .DS_Store
