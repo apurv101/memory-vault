@@ -1,6 +1,8 @@
 # Memory Vault
 
-Local, persistent memory for coding agents, served over MCP.
+Your coding agents don't share a memory. Memory Vault gives them one — teach Claude Code a convention, leave mid-task, and Codex picks up exactly where it stopped. No database, no embeddings: plain Markdown files on your machine, wired to every agent over MCP with one command.
+
+![Claude Code and Codex sharing one memory](demo.gif)
 
 Memory Vault stores facts as ordinary Markdown files. Each project gets an isolated memory space, while `shared/` holds facts that apply across projects. The files stay on your machine and remain usable if you change models or agent harnesses.
 
